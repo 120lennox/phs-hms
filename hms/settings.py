@@ -37,20 +37,62 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
 
     # 3rd party apps
     'rest_framework',
-    'dj_rest_auth',
+    'rest_framework.authtoken',
+    'rest_framework_simplejwt',
+    'drf_spectacular',
     'allauth',
     'allauth.account',
     'allauth.socialaccount',
+    'dj_rest_auth',
     'dj_rest_auth.registration',
-    'rest_framework.authtoken',
 
-    # local apps 
+    # local apps
     'hospitals',
-    'health_professionals'
+    'health_professionals',
+    'hms_engine',
 ]
+
+SITE_ID = 1
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Pulse Hospital Management System API',
+    'DESCRIPTION': 'API for the Pulse Hospital Management System with JWT Authentication',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    
+    # JWT Security scheme
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SECURITY': [
+        {
+            'Bearer': []
+        }
+    ],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'Bearer': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            }
+        }
+    },
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -129,3 +171,18 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ── dj-rest-auth / allauth ───────────────────────────────────────────────────
+ACCOUNT_EMAIL_VERIFICATION = 'none'   # disable e-mail confirmation for now
+ACCOUNT_LOGIN_METHODS = {'username'}  # username-only login
+ACCOUNT_SIGNUP_FIELDS = ['username*', 'password1*', 'password2*']  # email optional
+
+# Tell dj-rest-auth to issue JWT tokens instead of Knox/session tokens
+REST_AUTH = {
+    'USE_JWT': True,
+    'JWT_AUTH_COOKIE': None,          # stateless — no cookie
+    'JWT_AUTH_REFRESH_COOKIE': None,
+    'REGISTER_SERIALIZER': 'hms_engine.serializers.HospitalAdminRegisterSerializer',
+}

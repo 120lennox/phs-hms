@@ -40,7 +40,7 @@ class PractitionerSerializer(serializers.ModelSerializer):
         model = HealthProfessional
         fields = [
             'id',
-            'active',
+            'is_active',
             'identifier',
             'name',
             'telecom',
@@ -48,6 +48,7 @@ class PractitionerSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             'id': {'read_only': True},
+            'is_active': {'read_only': True},
         }
     
     def validate_name(self, value):
@@ -335,23 +336,227 @@ class HealthProfessionalDetailSerializer(serializers.Serializer):
     Returns Practitioner + PractitionerRole + Organization references.
     Useful for single resource retrieval with full context.
     """
-    
+
     practitioner = serializers.SerializerMethodField()
     practitioner_role = serializers.SerializerMethodField()
     organization = serializers.SerializerMethodField()
-    
+
     def get_practitioner(self, obj):
         """Get Practitioner representation"""
         serializer = PractitionerSerializer(obj)
         return serializer.to_representation(obj)
-    
+
     def get_practitioner_role(self, obj):
         """Get PractitionerRole representation"""
         serializer = PractitionerRoleSerializer(obj)
         return serializer.to_representation(obj)
-    
+
     def get_organization(self, obj):
         """Get Organization representation"""
         from hospitals.serializers import OrganizationSerializer
         serializer = OrganizationSerializer(obj.hospital)
         return serializer.to_representation(obj.hospital)
+
+
+# ── Practitioner Creation ──────────────────────────────────────────────────────
+
+class PractitionerCreateSerializer(PractitionerSerializer):
+    """
+    Extends PractitionerSerializer for creation.
+
+    Accepts the same FHIR fields (identifier, name, telecom, qualification)
+    PLUS:
+      - password / password2   → used to create the linked Django User account
+      - hospital               → UUID of the Hospital this practitioner belongs to
+      - department             → department name (write-only plain field)
+      - specialization         → one of HealthProfessional.SPECIALIZATION_CHOICES
+                                 (also derivable from qualification.code but kept
+                                  explicit for simplicity)
+
+    On create():
+      1. Extracts license_number from FHIR identifier (use='official')
+      2. Extracts first_name / last_name from FHIR name
+      3. Extracts email / phone from FHIR telecom
+      4. Creates Django User(username=license_number, ...)
+      5. Creates HealthProfessional linked to that User
+      6. registered_by is set by the view via perform_create()
+    """
+
+    from hospitals.models import Hospital as _Hospital  # avoid circular at class level
+
+    password = serializers.CharField(
+        write_only=True,
+        required=True,
+        style={'input_type': 'password'},
+        help_text="Initial password for the practitioner's login account",
+    )
+    password2 = serializers.CharField(
+        write_only=True,
+        required=True,
+        style={'input_type': 'password'},
+        help_text="Confirm password",
+    )
+    hospital = serializers.PrimaryKeyRelatedField(
+        read_only=True   # real queryset injected via get_fields()
+    )
+    department = serializers.CharField(
+        max_length=100,
+        write_only=True,
+        help_text="Department within the hospital (e.g. ICU, Outpatient)",
+    )
+    specialization = serializers.ChoiceField(
+        choices=HealthProfessional.SPECIALIZATION_CHOICES,
+        write_only=True,
+        help_text="Practitioner specialization key (e.g. general_medicine)",
+    )
+
+    def get_fields(self):
+        fields = super().get_fields()
+        from hospitals.models import Hospital
+        fields['hospital'] = serializers.PrimaryKeyRelatedField(
+            queryset=Hospital.objects.filter(is_active=True),
+            write_only=True,
+            help_text="UUID of the Hospital this practitioner is attached to",
+        )
+        return fields
+
+    class Meta(PractitionerSerializer.Meta):
+        fields = PractitionerSerializer.Meta.fields + [
+            'password',
+            'password2',
+            'hospital',
+            'department',
+            'specialization',
+        ]
+
+    # ── Validation ────────────────────────────────────────────────────────────
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        if attrs.get('password') != attrs.get('password2'):
+            raise serializers.ValidationError({"password": "Password fields didn't match."})
+
+        return attrs
+
+    def validate_password(self, value):
+        from django.contrib.auth.password_validation import validate_password
+        validate_password(value)
+        return value
+
+    # ── Create ────────────────────────────────────────────────────────────────
+
+    def create(self, validated_data):
+        """
+        1. Parse FHIR fields
+        2. Create Django User (license_number as username)
+        3. Create HealthProfessional linked to User
+        """
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        #── Pop non-FHIR extras ───────────────────────────────────────────────
+        password = validated_data.pop('password')
+        validated_data.pop('password2')
+        hospital = validated_data.pop('hospital')
+        department = validated_data.pop('department')
+        specialization = validated_data.pop('specialization')
+
+        # ── Pop FHIR arrays ───────────────────────────────────────────────────
+        identifier_data = validated_data.pop('identifier', [])
+        name_data = validated_data.pop('name', [])
+        telecom_data = validated_data.pop('telecom', [])
+        validated_data.pop('qualification', [])          # already have specialization
+
+        # ── Extract license_number ────────────────────────────────────────────
+        license_number = None
+        for ident in identifier_data:
+            if ident.get('use') == 'official' or FHIRSystems.license_number() in ident.get('system', ''):
+                license_number = ident.get('value')
+                break
+
+        if not license_number:
+            raise serializers.ValidationError(
+                {"identifier": "An official license_number identifier (use='official') is required."}
+            )
+
+        # ── Extract name ──────────────────────────────────────────────────────
+        official_name = next(
+            (n for n in name_data if n.get('use') == 'official'),
+            name_data[0] if name_data else {}
+        )
+        first_name = (official_name.get('given') or [''])[0]
+        last_name = official_name.get('family', '')
+        full_name = official_name.get('text') or f"{first_name} {last_name}".strip()
+
+        # ── Extract telecom ───────────────────────────────────────────────────
+        email = None
+        contact_number = None
+        for t in telecom_data:
+            if t.get('system') == 'email':
+                email = t.get('value')
+            elif t.get('system') == 'phone':
+                contact_number = t.get('value')
+
+        if not email:
+            raise serializers.ValidationError(
+                {"telecom": "An email telecom entry is required."}
+            )
+
+        # ── Create linked Django User ─────────────────────────────────────────
+        try:
+            user = User.objects.create_user(
+                username=license_number,
+                email=email,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+            )
+        except Exception as exc:
+            raise serializers.ValidationError(
+                {"user_creation": f"Failed to create login account: {exc}"}
+            )
+
+        # ── Create HealthProfessional ─────────────────────────────────────────
+        try:
+            hp = HealthProfessional.objects.create(
+                user=user,
+                license_number=license_number,
+                first_name=first_name,
+                last_name=last_name,
+                full_name=full_name,
+                email=email,
+                contact_number=contact_number,
+                specialization=specialization,
+                department=department,
+                hospital=hospital,
+                **validated_data,          # registered_by injected by view
+            )
+        except Exception as exc:
+            user.delete()                  # rollback User if HP creation fails
+            raise serializers.ValidationError(
+                {"health_professional_creation": f"Failed to create practitioner record: {exc}"}
+            )
+
+        return hp
+
+
+# ── Practitioner Login ────────────────────────────────────────────────────────
+
+class PractitionerLoginSerializer(serializers.Serializer):
+    """
+    Validates health professional credentials.
+
+    Login is by license_number + password (not by Django username/password)
+    because practitioners don't know they have a Django username — they know
+    their license number.
+
+    The view issues JWT tokens on success.
+    """
+    license_number = serializers.CharField(max_length=50, required=True)
+    password = serializers.CharField(
+        required=True,
+        write_only=True,
+        style={'input_type': 'password'},
+    )
+

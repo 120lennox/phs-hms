@@ -6,15 +6,34 @@ from hms.constants import (
     IdentifierTypes,
     OrganizationCategoryMapping
 )
-from django.contrib.auth.models import User
-from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 
-class OrganizationSerializer(serializers.ModelSerializer):
+class OrganizationListSerializer(serializers.ModelSerializer):
+    """
+    Lightweight serializer for hospital list endpoints.
+    Returns minimal fields for efficient list viewing.
+    """
+    
+    class Meta:
+        model = Hospital
+        fields = [
+            'id',
+            'name',
+            'category',
+            'is_active',
+            'contact_number',
+        ]
+        read_only_fields = ['id']
+
+
+class OrganizationDetailSerializer(serializers.ModelSerializer):
     """
     Serializes Hospital model to FHIR R4 Organization resource.
     Maps hospital data to FHIR standard for interoperability with CPR and other systems.
-    Compatible with CPR microservice.
+    Compatible with CPR microservice. Full detail view with all FHIR structures.
     """
     
     # FHIR input fields (write_only for receiving FHIR JSON)
@@ -98,18 +117,30 @@ class OrganizationSerializer(serializers.ModelSerializer):
         identifier_data = validated_data.pop('identifier', [])
         telecom_data = validated_data.pop('telecom', [])
         address_data = validated_data.pop('address', [])
-        
+
+        # Extract registration_number from FHIR identifier list
+        for ident in identifier_data:
+            system = ident.get('system', '')
+            if FHIRSystems.hospital_registration_number() in system or ident.get('use') == 'official':
+                validated_data['registration_number'] = ident.get('value')
+                break
+
+        if 'registration_number' not in validated_data:
+            raise serializers.ValidationError(
+                {"identifier": "A registration_number identifier (use='official') is required."}
+            )
+
         # Extract contact number from telecom
         for t in telecom_data:
             if t.get('system') == 'phone':
                 validated_data['contact_number'] = t.get('value')
-        
+
         # Extract address info
         if address_data:
             addr = address_data[0]
             validated_data['address'] = addr.get('text', '')
             validated_data['district'] = addr.get('district', '')
-        
+
         return Hospital.objects.create(**validated_data)
     
     def update(self, instance, validated_data):
@@ -209,47 +240,27 @@ class OrganizationSerializer(serializers.ModelSerializer):
             }
         ]
 
-class HospitalAdminRegisterSerializer(serializers.ModelSerializer):
-    """Serializer for hospital admin registration"""
-    password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
-    password2 = serializers.CharField(write_only=True, required=True)
+class UserProfileSerializer(serializers.ModelSerializer):
+    """Serializer for hospital admin user profile"""
+    # source must match the related_name on Hospital.created_by FK
+    managed_hospitals = OrganizationListSerializer(
+        many=True, read_only=True, source='created_hospitals'
+    )
 
     class Meta:
         model = User
         fields = [
+            'id',
             'username',
             'email',
-            'password',
-            'password2',
             'first_name',
             'last_name',
+            'is_staff',
+            'date_joined',
+            'managed_hospitals',
         ]
-        extra_kwargs = {
-            'first_name': {'required': True},   
-            'last_name': {'required': True},
-            'email': {'required': True},
-        }
-    
-    def validate(self, attrs):
-        if attrs['password'] != attrs['password2']:
-            raise serializers.ValidationError({"password": "Password fields didn't match."})
-        return attrs
-    
-    def validate_email(self, value):
-        if User.objects.filter(email=value).exists():
-            raise serializers.ValidationError("A user with this email already exists.")
-        return value
-    
-    def create(self, validated_data):
-        validated_data.pop('password2')
-        
-        user = User.objects.create_user(
-            username=validated_data['username'],
-            email=validated_data['email'],
-            password=validated_data['password'],
-            first_name=validated_data['first_name'],
-            last_name=validated_data['last_name'],
-            is_staff=True
-        )
-        
-        return user
+        read_only_fields = ['id', 'date_joined', 'is_staff']
+
+
+# Backward compatibility alias
+OrganizationSerializer = OrganizationDetailSerializer
