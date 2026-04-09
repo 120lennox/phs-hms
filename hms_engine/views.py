@@ -16,6 +16,11 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
+from .permissions import IsHospitalAdmin
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ── Hospital ──────────────────────────────────────────────────────────────────
@@ -39,9 +44,9 @@ class HospitalViewSet(viewsets.ModelViewSet):
         return OrganizationDetailSerializer
 
     def get_permissions(self):
-        """Read is open to any authenticated user; writes require is_staff."""
+        """Read is open to any authenticated user; writes require hospital admin."""
         if self.action in ('create', 'update', 'partial_update', 'destroy'):
-            return [IsAuthenticated(), IsAdminUser()]
+            return [IsAuthenticated(), IsHospitalAdmin()]
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
@@ -85,7 +90,7 @@ class HealthProfessionalViewSet(viewsets.ModelViewSet):
         if self.action == 'login':
             return [AllowAny()]
         if self.action in ('create', 'update', 'partial_update', 'destroy'):
-            return [IsAuthenticated(), IsAdminUser()]
+            return [IsAuthenticated(), IsHospitalAdmin()]
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
@@ -107,15 +112,28 @@ class HealthProfessionalViewSet(viewsets.ModelViewSet):
         serializer = PractitionerLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        license_number = serializer.validated_data['license_number']
-        password = serializer.validated_data['password']
+        # Strip whitespace to prevent subtle mismatches
+        raw_input      = serializer.validated_data['license_number'].strip()
+        password       = serializer.validated_data['password']
 
-        # Look up practitioner
+        # ── Normalise license_number ───────────────────────────────────────────
+        # staff_id is auto-generated as "HP-{license_number}".
+        # Accept both formats so users can enter either value.
+        if raw_input.upper().startswith('HP-'):
+            license_number = raw_input[3:]   # strip the "HP-" prefix
+        else:
+            license_number = raw_input
+
+        # ── Look up the practitioner ──────────────────────────────────────────
         try:
             hp = HealthProfessional.objects.select_related('user', 'hospital').get(
                 license_number=license_number
             )
         except HealthProfessional.DoesNotExist:
+            logger.warning(
+                'Login: practitioner not found — raw_input=%s resolved_license=%s',
+                raw_input, license_number,
+            )
             return Response(
                 {'detail': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -128,13 +146,31 @@ class HealthProfessionalViewSet(viewsets.ModelViewSet):
             )
 
         if hp.user is None:
+            logger.warning('Login: HP %s has no linked user account.', license_number)
             return Response(
                 {'detail': 'No login account linked to this practitioner. Contact your admin.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Verify password against the linked User account
-        if not hp.user.check_password(password):
+        # ── Verify credentials via Django auth pipeline ───────────────────────
+        # Use the Django username (== license_number) for authenticate()
+        # This correctly handles hashing, is_active, and auth backends.
+        authed_user = authenticate(
+            request,
+            username=hp.user.username,   # username was set to license_number at creation
+            password=password,
+        )
+
+        if authed_user is None:
+            # Fallback: direct check_password (handles edge cases with auth backends)
+            if not hp.user.check_password(password):
+                logger.warning('Login: bad password for license_number=%s', license_number)
+                return Response(
+                    {'detail': 'Invalid credentials.'},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+        elif authed_user.pk != hp.user.pk:
+            # Paranoia check: authenticated user doesn't match the HP's user
             return Response(
                 {'detail': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -154,7 +190,7 @@ class HealthProfessionalViewSet(viewsets.ModelViewSet):
                     'refresh': str(refresh),
                     'access': str(refresh.access_token),
                 },
-                'practitioner': PractitionerSerializer(hp).to_representation(hp),
+                'practitioner': HealthProfessionalDetailSerializer(hp).data,
             },
             status=status.HTTP_200_OK,
         )

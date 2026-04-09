@@ -31,7 +31,7 @@ class FHIRSystems:
     @staticmethod
     def license_number():
         """Official professional medical/healthcare license number"""
-        return "http://example.com/phs-hms/license-number"
+        return "urn:phs-hms:license-number"
     
     @staticmethod
     def practitioner_role_id():

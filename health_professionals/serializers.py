@@ -472,7 +472,7 @@ class PractitionerCreateSerializer(PractitionerSerializer):
         license_number = None
         for ident in identifier_data:
             if ident.get('use') == 'official' or FHIRSystems.license_number() in ident.get('system', ''):
-                license_number = ident.get('value')
+                license_number = (ident.get('value') or '').strip()
                 break
 
         if not license_number:
@@ -511,7 +511,11 @@ class PractitionerCreateSerializer(PractitionerSerializer):
                 password=password,
                 first_name=first_name,
                 last_name=last_name,
+                is_active=True,          # ensure account is always active
             )
+            # Force a clean password save in case any signal altered it
+            user.set_password(password)
+            user.save(update_fields=['password'])
         except Exception as exc:
             raise serializers.ValidationError(
                 {"user_creation": f"Failed to create login account: {exc}"}
