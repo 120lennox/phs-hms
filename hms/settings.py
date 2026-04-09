@@ -46,6 +46,10 @@ INSTALLED_APPS = [
     'allauth.socialaccount',
     'dj_rest_auth.registration',
     'rest_framework.authtoken',
+
+    # local apps 
+    'hospitals',
+    'health_professionals'
 ]
 
 MIDDLEWARE = [
